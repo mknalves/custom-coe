@@ -1,0 +1,26 @@
+parameters:
+  - name: serviceConnection
+    type: string
+  - name: connectorShareWithGroupTeamConfiguration
+    type: string
+
+steps:
+- pwsh: |
+    $hasConfiguration = -not ('${{ parameters.connectorShareWithGroupTeamConfiguration }}'.Contains("ConnectorShareWithGroupTeamConfiguration"))    
+
+    if ($hasConfiguration) {
+      # load PowerShell files into memory
+      . "$env:POWERSHELLPATH/dataverse-webapi-functions.ps1"
+      . "$env:POWERSHELLPATH/share-rows-with-group-team.ps1"
+
+      $config = ConvertFrom-Json '${{parameters.connectorShareWithGroupTeamConfiguration}}'
+      $dataverseHost = Get-HostFromUrl '${{parameters.serviceConnection}}'
+
+      foreach ($c in $config) {
+        if($c.aadGroupTeamName -ne '' -and $c.solutionComponentUniqueName -ne '') {
+            Write-Host "Sharing connector $c.solutionComponentUniqueName with $c.aadGroupTeamName"
+            Grant-AccessToConnector $env:SPNTOKEN $dataverseHost $c.aadGroupTeamName $c.solutionComponentUniqueName
+        }
+      } 
+    }
+  displayName: "Share Connectors with Group Team"

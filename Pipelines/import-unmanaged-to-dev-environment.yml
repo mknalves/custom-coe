@@ -1,0 +1,50 @@
+# variables passed in by API:
+# - Project
+# - Repo
+# - Branch
+# - SolutionName
+# - ServiceConnection
+# - BuildDefinitionId
+# - PipelineId
+# - EnvironmentName
+#
+# NOTE: If you want to use different values for these variables, you can remove the variable group and attach them directly to this pipeline.
+
+trigger: none
+pr: none
+
+variables:
+- group: alm-accelerator-variable-group
+
+name: import-$(SolutionName)
+
+stages:
+- stage: import_unmanaged_solution
+  displayName: 'Import unmanaged solution' 
+  jobs:
+  - job: import_unmanaged_solution
+  
+    pool:
+      vmImage: 'windows-2022'
+
+    steps:
+    - powershell: |
+        Write-Host "##vso[task.setvariable variable=RepoName]$(Repo)"
+      displayName: 'Set Source Repo Name'
+
+    - template: Templates\build-unmanaged-Solution.yml
+
+    - template: Templates\deploy-Solution.yml
+      parameters:
+        serviceConnection: '$(ServiceConnection)'
+        environmentVariables: '$(DevEnvironmentVariables)'
+        connectionReferences: '$(DevConnectionReferences)'
+        aadGroupTeamConfiguration: '$(DevAadGroupTeamConfiguration)'
+        aadGroupCanvasConfiguration: '$(DevAadGroupCanvasConfiguration)'
+        solutionComponentOwnershipConfiguration: '$(DevSolutionComponentOwnershipConfiguration)'
+        importUnmanaged: 'true'
+        skipBuildToolsInstaller: 'true'
+        
+    - template: Templates\update-canvas-app-ownership.yml
+      parameters:
+        serviceConnection: '$(ServiceConnection)'

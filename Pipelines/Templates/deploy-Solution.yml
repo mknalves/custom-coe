@@ -1,0 +1,373 @@
+# This is a deployment template referenced from build-deploy-Solution.yml
+
+# build-deploy-Solution.yml calls this template twice, passing different connection information for test vs prod
+parameters:
+- name: serviceConnection
+  type: string
+- name: environmentVariables
+  type: string
+- name: connectionReferences
+  type: string
+- name: aadGroupTeamConfiguration
+  type: string
+- name: aadGroupCanvasConfiguration
+  type: string
+- name: solutionComponentOwnershipConfiguration
+  type: string
+- name: importUnmanaged
+  type: string
+  default: 'false'
+- name: overwriteUnmanagedCustomizations
+  type: string
+  default: 'true'
+- name: skipBuildToolsInstaller
+  type: string
+  default: 'false'
+- name: cacheEnabled
+  type: string
+  default: 'true'
+
+steps:
+- template: set-spn-token.yml
+  parameters:
+    serviceConnection: '$(ServiceConnection)'
+# Set pipeline vars for tools paths.
+- template: set-tools-paths.yml
+
+# Restore PowerShell Module dependencies if available in cache
+# https://docs.microsoft.com/en-us/azure/devops/pipelines/release/caching?view=azure-devops
+- task: Cache@2
+  displayName: Cache Powershell Modules
+  inputs:
+    key:  restoremodules | "$(powerPlatformToolsSubPath)" | $(Pipeline.Workspace)/PipelineUtils/Pipelines/Templates/install-powershell-modules.yml
+    path: $(powerPlatformToolsPath)
+    cacheHitVar: powerPlatformToolsPath_IsCached
+  condition: and(succeeded(), eq('${{parameters.cacheEnabled}}', 'true'))
+
+- task: microsoft-IsvExpTools.PowerPlatform-BuildTools.tool-installer.PowerPlatformToolInstaller@0
+  displayName: 'Install Power Platform Build Tools'
+  condition: and(succeeded(), eq('${{parameters.skipBuildToolsInstaller}}', 'false'))
+
+- template: install-powershell-modules.yml
+
+# Other tasks, which use the PowerApps PowerShell cmdlets, need the environment guid.  Setting it for future use.
+- template: set-environment-id.yml
+  parameters:
+    serviceConnection: '${{parameters.serviceConnection}}'
+
+# Other tasks, in this pipeline need to know if the solution already exists. Setting it for future use.
+- template: set-solution-exists.yml
+  parameters:
+    serviceConnection: '${{parameters.serviceConnection}}'
+
+# Get the solution package from artifact uploaded by the build pipeline
+- task: DownloadPipelineArtifact@2
+  displayName: 'Download Build Pipeline Artifact'
+
+- powershell: |
+   $artifactDropPath = '$(Pipeline.Workspace)/drop/'
+   If (Test-Path -Path "$(Pipeline.Workspace)/buildPipeline/drop")
+   {
+       $artifactDropPath = "$(Pipeline.Workspace)/buildPipeline/drop/"
+   }
+   Write-Host "##vso[task.setVariable variable=ArtifactDropPath]$artifactDropPath"
+  displayName: 'Get artifact drop path'
+
+# Set paths to deployment settings
+- template: set-deployment-configuration-paths.yml
+  parameters:
+    configPath: $(ArtifactDropPath)
+    environmentName: $(EnvironmentName)
+
+# Update any deploymentSettings.json via FileTransform task. This task will replace values in a JSON file based on their path. See https://docs.microsoft.com/en-us/azure/devops/pipelines/tasks/transforms-variable-substitution?view=azure-devops&tabs=Classic#jsonvarsubs
+- task: FileTransform@1
+  displayName: 'File Transformation: deploymentSettings.json'
+  inputs:
+    folderPath: '$(ArtifactDropPath)'
+    targetFiles: '*deploymentSettings*.json'
+    fileType: json
+  condition: and(succeeded(), or(ne(variables['DeploymentSettingsPath'], ''), ne(variables['CustomDeploymentSettingsPath'], '')))
+
+# Third party task to replace tokens in files. The FileTransform above replaces JSON tokens based on their path as opposed to replacing text tokens in a file which can be more error prone in some cases.
+# If you aren't using this task it can be safely removed or disabled by setting enabled: false. Sample token: #{VariableNameToReplace}#
+- task: qetza.replacetokens.replacetokens-task.replacetokens@3
+  displayName: 'Replace Tokens: deploymentSettings.json'
+  inputs:
+    rootDirectory: '$(ArtifactDropPath)'
+    targetFiles: '*deploymentSettings*.json'
+    actionOnMissing: 'silently continue'
+    writeBOM: false
+    encoding: 'utf-8'
+    defaultValue: ''
+  condition: and(succeeded(), or(ne(variables['DeploymentSettingsPath'], ''), ne(variables['CustomDeploymentSettingsPath'], '')))
+  enabled: true
+
+
+# If called from import-unmanaged-to-dev-environment.yml, this task will run to deploy an unmanaged solution
+- task: microsoft-IsvExpTools.PowerPlatform-BuildTools.import-solution.PowerPlatformImportSolution@0
+  displayName: 'Import Unmanaged Solution'
+  inputs:
+    authenticationType: PowerPlatformSPN
+    PowerPlatformSPN: '${{parameters.serviceConnection}}'
+    SolutionInputFile: '$(UnmanagedSolutionPath)'
+    PublishWorkflows: true
+    UseDeploymentSettingsFile: $(UseDeploymentSettings)
+    DeploymentSettingsFile: $(DeploymentSettingsPath)
+  condition: and(succeeded(), eq('${{parameters.importUnmanaged}}', 'true'))
+
+- powershell: |
+    $managedSolutionPath = ''
+    $artifactDropPath = "$(Pipeline.Workspace)/buildPipeline/drop/"
+    #Attempt to find the managed solution in the build pipeline drop if build and deploy are seperate pipelines
+    Get-ChildItem -Path "$(ArtifactDropPath)" -Filter "$(SolutionName)*.zip" | 
+    ForEach-Object {
+        If ($_.FullName.Contains("_managed")) 
+        { 
+            $managedSolutionPath = $_.FullName 
+        }
+    }
+    Write-Host "##vso[task.setVariable variable=ManagedSolutionPath]$managedSolutionPath"
+  displayName: 'Get managed solution zip path'
+  condition: and(succeeded(), ne('${{parameters.importUnmanaged}}', 'true'))
+
+- powershell: |    
+    echo "##vso[task.setvariable variable=TriggerSolutionUpgrade;isOutput=true]false"
+
+    $solutionUpgradeLabel = "solution-upgrade"
+
+    $triggerSolutionUpgrade = '$(TriggerSolutionUpgrade)'
+    $triggerSolutionUpgradeVariableSupplied = !$triggerSolutionUpgrade.Contains("TriggerSolutionUpgrade")
+
+    # If the TriggerSolutionUpgrade variable is set at queue time, then override the logic to determine solution upgrade based on PR label of solution-upgrade
+    if ($triggerSolutionUpgradeVariableSupplied) {
+      echo "##vso[task.setvariable variable=TriggerSolutionUpgrade;isOutput=true]$triggerSolutionUpgrade"
+    }
+    else {
+      # In order to determine if we need to perform a Solution Upgrade, we see if the Pull Request has a label of solution-upgrade on it.
+      # The only way we know how to determine if the PR that created the commit for the branch had a label is to use the REST API
+
+      if ("$(Build.Reason)" -ne "PullRequest") { 
+        Write-Host "Build.Repository.Provider is $(Build.Repository.Provider)"
+
+        if("$(Build.Repository.Provider)" -eq "TfsGit") {      
+          $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+          $headers.Add("Authorization", "Bearer $env:SYSTEM_ACCESSTOKEN")
+          $headers.Add("Content-Type", "application/json")
+
+          $buildSourceVersion = "$(Build.SourceVersion)"        
+
+          $pullrequestqueryBody = "{
+          `n  `"queries`": [
+          `n    {
+          `n      `"type`": `"lastMergeCommit`",
+          `n      `"items`": [ `"$buildSourceVersion`" ]
+          `n    }
+          `n  ]
+          `n}"
+
+          $pullrequestqueryBodyResourceUrl = "$(System.TeamFoundationCollectionUri)$(System.TeamProjectId)/_apis/git/repositories/$(Build.Repository.Name)/pullrequestquery?api-version=6.0"
+          $pullrequestqueryResponse = Invoke-RestMethod $pullrequestqueryBodyResourceUrl -Method 'POST' -Headers $headers -Body $pullrequestqueryBody 
+          $pullrequestqueryResponseResults = $pullrequestqueryResponse.results
+          $pullRequestId = $pullrequestqueryResponseResults.$buildSourceVersion.pullRequestId
+          if (-not [string]::IsNullOrEmpty($pullRequestId)) {
+            $pullRequestLabelQuery = "$(System.TeamFoundationCollectionUri)$(System.TeamProjectId)/_apis/git/repositories/$(Build.Repository.Name)/pullRequests/$pullRequestId/labels?api-version=6.0"
+            
+            $pullRequestLabelQueryResponse = Invoke-RestMethod -Uri $pullRequestLabelQuery -Method Get -Headers @{
+              Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN"
+            }
+
+            $pullRequestLabelQueryResponseValue = $pullRequestLabelQueryResponse.value
+
+            if ($pullRequestLabelQueryResponseValue.Count -gt 0) {
+              $triggerSolutionUpgrade = $pullRequestLabelQueryResponseValue.name.Contains($solutionUpgradeLabel).ToString().ToLower()
+              echo "##vso[task.setvariable variable=TriggerSolutionUpgrade;isOutput=true]$triggerSolutionUpgrade"
+            }
+          }
+        }
+        
+        if("$(Build.Repository.Provider)" -eq "GitHub") {
+          $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+          $headers.Add("Accept", "application/vnd.github.groot-preview+json")
+          $headers.Add("Authorization", "Bearer $(GitHubPAT)")
+
+          # NOTE: Since this is for internal use only right now, we are hardcoding microsoft/coe-starter-kit
+          #       We will consider improving this in the future, but needed minimum to get it working for preview release
+          $pullsRequest = "https://api.github.com/repos/microsoft/coe-starter-kit/commits/$(Build.SourceVersion)/pulls"
+          
+          $pullsResponse = Invoke-RestMethod $pullsRequest -Method 'GET' -Headers $headers
+          
+          if ($pullsResponse.Count -gt 0) {
+            $pullNumber = $pullsResponse[0].number
+            $issuesRequest = "https://api.github.com/repos/microsoft/coe-starter-kit/issues/$pullNumber"
+            $issuesResponse = Invoke-RestMethod $issuesRequest -Method 'GET' -Headers $headers 
+            
+            if ($issuesResponse.labels.Count -gt 0) {
+              $triggerSolutionUpgrade = $issuesResponse.labels.name.Contains($solutionUpgradeLabel).ToString().ToLower()
+              echo "##vso[task.setvariable variable=TriggerSolutionUpgrade;isOutput=true]$triggerSolutionUpgrade"
+            }
+          }
+        }
+      }
+    }
+  name: setTriggerSolutionUpgrade
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+  condition: and(succeeded(), ne('${{parameters.importUnmanaged}}', 'true'))
+  displayName: 'Set TriggerSolutionUpgrade Variable'
+
+# If the TriggerSolutionUpgrade variable is false, then import the solution as an Update
+- task: microsoft-IsvExpTools.PowerPlatform-BuildTools.import-solution.PowerPlatformImportSolution@0
+  displayName: 'Import Managed Solution as Update'
+  inputs:
+    authenticationType: PowerPlatformSPN
+    PowerPlatformSPN: '${{parameters.serviceConnection}}'
+    SolutionInputFile: $(ManagedSolutionPath)
+    PublishWorkflows: true
+    OverwriteUnmanagedCustomizations: ${{parameters.overwriteUnmanagedCustomizations}}
+    UseDeploymentSettingsFile: $(UseDeploymentSettings)
+    DeploymentSettingsFile: $(DeploymentSettingsPath)
+  condition: and(succeeded(), ne('${{parameters.importUnmanaged}}', 'true'), or(eq(variables['setTriggerSolutionUpgrade.TriggerSolutionUpgrade'], 'false'), eq(variables['SolutionExists'], 'false')))
+
+# If the TriggerSolutionUpgrade variable is true, then import the solution as an Upgrade, staging it as a holding solution, so we can apply a solution Upgrade.
+# Doing this will ensure that items removed from the solution in development are also removed from the solution in the target environment after the Upgrade is applied.
+- task: microsoft-IsvExpTools.PowerPlatform-BuildTools.import-solution.PowerPlatformImportSolution@0
+  displayName: 'Import Managed Solution as Upgrade'
+  inputs:
+    authenticationType: PowerPlatformSPN
+    PowerPlatformSPN: '${{parameters.serviceConnection}}'
+    SolutionInputFile: $(ManagedSolutionPath)
+    HoldingSolution: true
+    OverwriteUnmanagedCustomizations: ${{parameters.overwriteUnmanagedCustomizations}}
+    UseDeploymentSettingsFile: $(UseDeploymentSettings)
+    DeploymentSettingsFile: $(DeploymentSettingsPath)
+  condition: and(succeeded(), ne('${{parameters.importUnmanaged}}', 'true'), eq(variables['setTriggerSolutionUpgrade.TriggerSolutionUpgrade'], 'true'), eq(variables['SolutionExists'], 'true'))
+
+# NOTE: Sometimes you need to perform intermediary steps between staging the upgrade and applying it.  
+# An example would be moving data from one entity to another before deleting the entity.
+# You would add steps to your pipeline here to accomplish this. 
+
+# If the TriggerSolutionUpgrade variable is true,then apply the solution Upgrade.
+- task: microsoft-IsvExpTools.PowerPlatform-BuildTools.apply-solution-upgrade.PowerPlatformApplySolutionUpgrade@0
+  inputs:
+    authenticationType: 'PowerPlatformSPN'
+    PowerPlatformSPN: '${{parameters.serviceConnection}}'
+    SolutionName: '$(SolutionName)'
+    AsyncOperation: true
+  condition: and(succeeded(), eq(variables['setTriggerSolutionUpgrade.TriggerSolutionUpgrade'], 'true'), eq(variables['SolutionExists'], 'true'))
+
+- task: microsoft-IsvExpTools.PowerPlatform-BuildTools.publish-customizations.PowerPlatformPublishCustomizations@0
+  displayName: 'Power Platform Publish Customizations '
+  inputs:
+    authenticationType: PowerPlatformSPN
+    PowerPlatformSPN: '${{parameters.serviceConnection}}'
+  condition: and(succeeded(), eq('${{parameters.importUnmanaged}}', 'true'))
+  # Only publish customizations for when importing unmanaged solutions into a dev environment.
+
+# Set deployment variable for Activate Flow Configuration
+- template: set-deployment-variable.yml
+  parameters:
+    variableName: 'outActivateFlows'
+    pipelineVariableValue: ''
+    deploymentSettingsPath: $(CustomDeploymentSettingsPath)
+    deploymentSettingsNode: 'ActivateFlowConfiguration'
+    displayName: 'Retrieve Flow Activation Config for Deploy'
+
+# Set deployment variable for AAD Group Team Configuration
+- template: set-deployment-variable.yml
+  parameters:
+    variableName: 'outAadGroupTeamConfiguration'
+    pipelineVariableValue: '${{parameters.aadGroupTeamConfiguration}}'
+    deploymentSettingsPath: $(CustomDeploymentSettingsPath)
+    deploymentSettingsNode: 'AadGroupTeamConfiguration'
+    displayName: 'Retrieve AAD Group Team Config for Deploy'
+
+- template: set-dataverse-aad-group-teams.yml
+  parameters:
+    serviceConnection: '${{parameters.serviceConnection}}'
+    aadGroupTeamConfiguration: '$(outAadGroupTeamConfiguration)'
+
+- template: set-deployment-variable.yml
+  parameters:
+    variableName: 'outAadGroupCanvasConfiguration'
+    pipelineVariableValue: '${{parameters.aadGroupCanvasConfiguration}}'
+    deploymentSettingsPath: $(CustomDeploymentSettingsPath)
+    deploymentSettingsNode: 'AadGroupCanvasConfiguration'
+    displayName: 'Retrieve AAD Group Canvas Config for Deploy'
+
+- template: share-canvas-app-with-aad-group.yml
+  parameters:
+    serviceConnection: '${{parameters.serviceConnection}}'
+    aadGroupCanvasConfiguration: '$(outAadGroupCanvasConfiguration)'
+
+- template: set-deployment-variable.yml
+  parameters:
+    variableName: 'outSolutionComponentOwnershipConfiguration'
+    pipelineVariableValue: '${{parameters.solutionComponentOwnershipConfiguration}}'
+    deploymentSettingsPath: $(CustomDeploymentSettingsPath)
+    deploymentSettingsNode: 'SolutionComponentOwnershipConfiguration'
+    displayName: 'Retrieve Solution Component Onwership Config for Deploy'
+
+- template: update-solution-component-ownership.yml
+  parameters:
+    displayName: 'Update Solution Component Ownwership'
+    serviceConnection: '${{parameters.serviceConnection}}'
+    solutionComponentOwnershipConfiguration: '$(outSolutionComponentOwnershipConfiguration)'
+    activateFlowConfiguration: '$(outActivateFlows)'
+    enableFlows: 'false'
+    updateComponentOnwership: 'true'
+
+- template: set-deployment-variable.yml
+  parameters:
+    variableName: 'outConnectionReferences'
+    pipelineVariableValue: '${{parameters.connectionReferences}}'
+    deploymentSettingsPath: $(DeploymentSettingsPath)
+    deploymentSettingsNode: 'ConnectionReferences'
+    displayName: 'Retrieve Connection Reference Config for Deploy'
+
+- template: activate-flows.yml
+  parameters:
+    displayName: 'Activate Flows'
+    serviceConnection: '${{parameters.serviceConnection}}'
+    connectionReferences: '$(outConnectionReferences)'
+    solutionComponentOwnershipConfiguration: '$(outSolutionComponentOwnershipConfiguration)'
+    activateFlowConfiguration: '$(outActivateFlows)'
+
+- template: set-deployment-variable.yml
+  parameters:
+    variableName: 'outFlowShareWithGroupTeamConfiguration'
+    pipelineVariableValue: 'no-op'
+    deploymentSettingsPath: $(CustomDeploymentSettingsPath)
+    deploymentSettingsNode: 'FlowShareWithGroupTeamConfiguration'
+    displayName: 'Retrieve Flow Share with Group Team Configuration for Deploy'
+
+- template: share-flows-with-group-team.yml
+  parameters:
+    serviceConnection: '${{parameters.serviceConnection}}'
+    flowShareWithGroupTeamConfiguration: '$(outFlowShareWithGroupTeamConfiguration)'
+
+- template: set-deployment-variable.yml
+  parameters:
+    variableName: 'outConnectorShareWithGroupTeamConfiguration'
+    pipelineVariableValue: 'no-op'
+    deploymentSettingsPath: $(CustomDeploymentSettingsPath)
+    deploymentSettingsNode: 'ConnectorShareWithGroupTeamConfiguration'
+    displayName: 'Retrieve Connector Share with Group Team Configuration for Deploy'
+
+- template: share-connectors-with-group-team.yml
+  parameters:
+    serviceConnection: '${{parameters.serviceConnection}}'
+    connectorShareWithGroupTeamConfiguration: '$(outConnectorShareWithGroupTeamConfiguration)'
+
+- template: import-configuration-migration-data.yml
+  parameters:
+    serviceConnection: '${{parameters.serviceConnection}}'
+
+- template: run-canvas-tests.yml 
+  parameters:
+    serviceConnection: '${{parameters.serviceConnection}}'
+    aadHost: '$(AadHost)'
+    solutionName: '$(SolutionName)'
+    testAccountUsername: '$(TestAutomationUsername)'
+    testAccountPassword: '$(TestAutomationPassword)'
+    makerPortalUrl: '$(TestAutomationMakerPortalUrl)'
+    loginMethod: '$(TestAutomationLoginMethod)'

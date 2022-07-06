@@ -1,0 +1,24 @@
+# Multi-stage starter template for:
+# -Building the solution when changes to the contents of the solution folder are triggered (see trigger-SolutionName.yml for example trigger)
+# -Deploying the solution to a specific environment based on pipeline variables
+# This is most commonly used for PR Validation where both the build and deploy must suceeed in order for the PR checks to succeed.
+stages:
+- stage: build_and_deploy
+  displayName: 'Build and Deploy' 
+  jobs:
+  - job: build_and_deploy_job
+    pool: 
+      vmImage: 'windows-2022'
+    steps:
+    - template: build-unmanaged-managed-Solution.yml
+
+    - template: deploy-Solution.yml
+      parameters:
+        serviceConnection: '$(ServiceConnection)'
+        environmentVariables: '$(EnvironmentVariables)'
+        connectionReferences: '$(ConnectionReferences)'
+        aadGroupTeamConfiguration: '$(AadGroupTeamConfiguration)'
+        aadGroupCanvasConfiguration: '$(AadGroupCanvasConfiguration)'
+        solutionComponentOwnershipConfiguration: '$(SolutionComponentOwnershipConfiguration)'
+        importUnmanaged: '$(ImportUnmanaged)'
+        skipBuildToolsInstaller: 'true'

@@ -1,0 +1,29 @@
+stages:
+- stage: deploy
+  displayName: 'Deploy to Environment'
+  jobs:
+  - deployment: 
+    pool: 
+      vmImage: 'windows-2022'
+    environment: '$(EnvironmentName)'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: PipelineRepo
+            path: 'PipelineUtils'
+            displayName: 'Checkout Pipeline Branch'
+
+          - template: deploy-Solution.yml
+            parameters:
+              serviceConnection: '$(ServiceConnection)'
+              environmentVariables: '$(EnvironmentVariables)'
+              connectionReferences: '$(ConnectionReferences)'
+              aadGroupTeamConfiguration: '$(AadGroupTeamConfiguration)'
+              aadGroupCanvasConfiguration: '$(AadGroupCanvasConfiguration)'
+              solutionComponentOwnershipConfiguration: '$(SolutionComponentOwnershipConfiguration)'
+              overwriteUnmanagedCustomizations: $(OverwriteUnmanagedCustomizations)
+              importUnmanaged: '$(ImportUnmanaged)'
+              cacheEnabled: 'false'
+          - publish: $(Pipeline.Workspace)/buildPipeline/drop/
+            artifact: drop

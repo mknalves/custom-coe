@@ -1,0 +1,31 @@
+parameters:
+- name: canvasUnpackVersion
+  type: string
+steps:
+# TEMPORARY WORKAROUND: Power Apps CLI functionality will eventually be surfaced in Azure DevOps tasks.
+# However, to use functionality ahead of the tasks, we install the CLI.  Once the task is available, we move to using the task.
+- powershell: |
+    #NOTE: Add new versions of canvas unpack and the associated pac CLI version to the versionDictionary to ensure unpacked versions are packed correctly.
+    #.24 is the only version supported in the release of our pipelines the latest version of PAC CLI should be used until a new version is available at which time we
+    #would add new versions here
+    $versionDictionary = @{ "0.24" = ""}
+
+    $nugetPackage = "Microsoft.PowerApps.CLI"
+    $nugetPackageVersion = '$(pacVersion)'
+    if('${{ parameters.canvasUnpackVersion }}' -ne '') {
+        $nugetPackageVersion = $versionDictionary['${{ parameters.canvasUnpackVersion }}']
+    }
+    elseif($nugetPackageVersion.Contains("pacVersion")) {
+      $nugetPackageVersion =  ""
+    }
+    $outFolder = "pac"
+    if($nugetPackageVersion -ne '') {
+        nuget install $nugetPackage -Version $nugetPackageVersion -OutputDirectory $outFolder
+    }
+    else {
+        nuget install $nugetPackage -OutputDirectory $outFolder
+    }
+    $pacNugetFolder = Get-ChildItem $outFolder | Where-Object {$_.Name -match $nugetPackage + "."}
+    $pacPath = $pacNugetFolder.FullName + "\tools"
+    echo "##vso[task.setvariable variable=pacPath]$pacPath"
+  displayName: 'Install pac cli'
